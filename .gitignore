@@ -1,0 +1,19 @@
+# Secrets and Config
+config.py
+secret.key
+
+# Databases and state
+*.db
+*.db-shm
+*.db-wal
+*.json
+*.lock
+go2rtc.yaml
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Temp files
+/tmp/
