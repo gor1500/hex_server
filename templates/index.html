@@ -159,10 +159,11 @@
                     <label class="switch"><input type="checkbox" id="camera-toggle"><span class="slider"></span></label>
                 </div>
                 <div class="time-label" style="text-align:right; font-size:11px; color:var(--text-muted); margin-bottom:10px;">Toggle OFF to kill camera internet</div>
-                <div class="stat-row" style="margin-top: 15px; border-top: 1px solid #334155; padding-top: 15px;">
-                    <span class="stat-label">Wake-on-LAN (Fedora PC)</span>
-                    <button class="btn" onclick="sendWoL()" style="padding: 4px 8px; font-size: 12px;">Wake PC</button>
+                <div class="stat-row">
+                    <span class="stat-label">Camera Alerts (Discord)</span>
+                    <label class="switch"><input type="checkbox" id="camera-alerts-toggle"><span class="slider"></span></label>
                 </div>
+
             </div>
         </div>
 
@@ -413,7 +414,7 @@
                     const usedMem = data.system.total_memory - data.system.free_memory;
                     document.getElementById('memory').textContent = `Used: ${usedMem} MB | Free: ${data.system.free_memory} MB (Total: ${data.system.total_memory} MB)`;
                 }
-                document.getElementById('bedtime-toggle').checked = data.bedtime; document.getElementById('camera-toggle').checked = !data.camera_kill; document.getElementById('bedtime-text').textContent = data.bedtime_time || 'Not set';
+                document.getElementById('bedtime-toggle').checked = data.bedtime; document.getElementById('camera-toggle').checked = !data.camera_kill; document.getElementById('camera-alerts-toggle').checked = data.camera_alerts; document.getElementById('bedtime-text').textContent = data.bedtime_time || 'Not set';
                 if (data.panic !== isPanic) { isPanic = data.panic; document.getElementById('panic-btn').textContent = isPanic ? "RESTORE INTERNET" : "PANIC: Kill Internet"; }
                 const pingEl = document.getElementById('ping-val'); pingEl.textContent = data.ping > 0 ? data.ping.toFixed(0) + ' ms' : 'Offline'; pingEl.style.color = data.ping < 50 ? 'var(--success)' : (data.ping < 100 ? '#fbbf24' : 'var(--danger)');
                 document.querySelector('#iface-table tbody').innerHTML = data.interfaces.map(i => {
@@ -494,6 +495,9 @@
         function copyLogs() { let text = ""; currentLogs.forEach(l => { text += `[${l.time}] ${l.topics} ${l.message}\n`; }); navigator.clipboard.writeText(text).then(() => { const btn = document.getElementById('copy-btn'); btn.textContent = "Copied!"; setTimeout(() => btn.textContent = "Copy", 2000); }); }
         function togglePause() { logsPaused = !logsPaused; const btn = document.getElementById('pause-btn'); btn.textContent = logsPaused ? "Resume" : "Pause"; btn.style.color = logsPaused ? "var(--accent)" : "#fff"; }
         
+        document.getElementById('camera-alerts-toggle').addEventListener('change', async (e) => {
+            await fetch('/api/toggle_camera_alerts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: e.target.checked ? 'enable' : 'disable' }) });
+        });
         document.getElementById('camera-toggle').addEventListener('change', async (e) => { await fetch('/api/camera', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: e.target.checked ? 'disable' : 'enable' }) }); });
         document.getElementById('bedtime-toggle').addEventListener('change', async (e) => { await fetch('/api/bedtime', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: e.target.checked ? 'enable' : 'disable' }) }); });
 

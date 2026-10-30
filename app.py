@@ -69,7 +69,7 @@ TELEMETRY_WRITE_INTERVAL = 10
 
 latest_telemetry = {
     "system": None, "interfaces": [], "bedtime": False, "bedtime_time": "-",
-    "speed": {"rx": 0, "tx": 0}, "panic": False, "camera_kill": False,
+    "speed": {"rx": 0, "tx": 0}, "panic": False, "camera_kill": False, "camera_alerts": False,
     "temp": "--", "ping": 0,
 }
 
@@ -80,7 +80,9 @@ _state = {
     "last_hourly_sent": 0,
     "last_daily_sent": 0,
     "last_cleanup": 0,
-    "last_shutdown": 0
+    "last_shutdown": 0,
+    "last_shutdown_reason": "",
+    "camera_alerts": False
 }
 
 MAC_VENDORS = {
@@ -235,24 +237,50 @@ def send_info(title, message, color=3447003, severity="info"):
 # --- SHUTDOWN & STARTUP HANDLERS ---
 
 def handle_shutdown(signum, frame):
-    print("Shutdown signal received. Sending alert...")
-    send_discord_raw("[INFO] Dashboard Host Offline", "The Fedora PC is shutting down. Telemetry and monitoring will be paused.", 10181046)
     _state["last_shutdown"] = int(time.time())
+    _state["last_shutdown_reason"] = "clean"
     save_state()
+    print("Shutdown signal received, state saved.")
     sys.exit(0)
 
 def startup_catchup():
     last_shutdown = _state.get("last_shutdown", 0)
-    if last_shutdown == 0: return
-    now = int(time.time()); offline_seconds = now - last_shutdown
-    if offline_seconds < 60: return
-    hours = offline_seconds // 3600; minutes = (offline_seconds % 3600) // 60
-    conn = sqlite3.connect(DB_FILE, timeout=5); c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM incidents WHERE timestamp > ?", (last_shutdown,))
-    missed_incidents = c.fetchone()[0]; conn.close()
-    msg = f"The host was offline for **{hours}h {minutes}m**.\nMissed events during downtime: **{missed_incidents}**."
-    send_discord_raw("[INFO] Dashboard Host Online", msg, 3066993)
-    _state["last_shutdown"] = 0; save_state()
+    last_hb = 0
+    try:
+        with open("data/heartbeat", "r") as f:
+            last_hb = int(f.read().strip())
+    except Exception:
+        pass
+    last_seen = max(last_shutdown, last_hb)
+    if last_seen == 0:
+        return
+    now = int(time.time())
+    offline = now - last_seen
+    if offline < 120:
+        _state["last_shutdown"] = 0
+        _state["last_shutdown_reason"] = ""
+        save_state()
+        return
+    clean = _state.get("last_shutdown_reason", "") == "clean"
+    hours = offline // 3600
+    minutes = (offline % 3600) // 60
+    if clean:
+        label = "Dashboard Host Online"
+        msg = f"Rebooted cleanly. Offline for **{hours}h {minutes}m**."
+        try:
+            send_discord_raw(f"[INFO] {label}", msg, 3066993)
+        except Exception:
+            pass
+    else:
+        label = "Dashboard Host Online (CRASHED)"
+        msg = f"Previous session crashed. Offline for **{hours}h {minutes}m**."
+        try:
+            send_discord_raw(f"[URGENT] {label}", msg, 15105570, ping=True)
+        except Exception:
+            pass
+    _state["last_shutdown"] = 0
+    _state["last_shutdown_reason"] = ""
+    save_state()
 
 signal.signal(signal.SIGTERM, handle_shutdown)
 atexit.register(lambda: handle_shutdown(None, None) if os.environ.get("WERKZEUG_RUN_MAIN") == "true" else None)
@@ -266,15 +294,14 @@ def sync_go2rtc():
         safe_user = urllib.parse.quote(c['username']) if c['username'] else ""
         safe_pass = urllib.parse.quote(c['password']) if c['password'] else ""
         auth_url = c['rtsp_url'].replace("rtsp://", f"rtsp://{safe_user}:{safe_pass}@") if safe_user and safe_pass else c['rtsp_url']
-        
-        # Force sub-stream for local dashboard viewing
+
         if "/101" in auth_url: auth_url = auth_url.replace("/101", "/102")
         yaml_content += f"  cam_{c['id']}:\n    - {auth_url}\n"
-        
+
         try:
             requests.put(f"http://127.0.0.1:1984/api/streams?name=cam_{c['id']}", data={"src": auth_url}, timeout=2)
         except Exception: pass
-        
+
     with open("data/go2rtc.yaml", "w") as f:
         f.write(yaml_content)
 
@@ -283,8 +310,7 @@ def sync_go2rtc():
 @login_required
 def scan_cameras():
     nat_rules = get_mikrotik_data("ip/firewall/nat")
-    
-    # 1. Build NAT map: { "192.168.1.14": "192.168.88.14" }
+
     nat_map = {}
     if nat_rules:
         for rule in nat_rules:
@@ -293,8 +319,7 @@ def scan_cameras():
                 to_addr = rule.get("to-addresses")
                 if dst and to_addr:
                     nat_map[to_addr.split("/")[0]] = dst.split("/")[0]
-                    
-    # 2. Force MikroTik to ping the physical IPs so they show up in the ARP table
+
     for physical_ip in nat_map.keys():
         try: subprocess.run(["ping", "-c", "1", "-W", "1", physical_ip], capture_output=True, timeout=2)
         except: pass
@@ -310,7 +335,7 @@ def scan_cameras():
     }
 
     found_cams = {}
-    
+
     for entry in arp_table:
         ip = entry.get("address")
         mac = entry.get("mac-address", "").upper()
@@ -319,7 +344,7 @@ def scan_cameras():
         prefix = mac[:8]
         if prefix in cam_vendors:
             vendor = cam_vendors[prefix]
-            
+
             if ip in nat_map:
                 final_ip = nat_map[ip]
                 nat_status = f"NAT Active (Mapped to {final_ip})"
@@ -333,7 +358,6 @@ def scan_cameras():
             rtsp_path = "/Streaming/Channels/101" if "Hikvision" in vendor or "HiLook" in vendor else "/cam/realmonitor?channel=1&subtype=0"
             rtsp_url = f"rtsp://{final_ip}:554{rtsp_path}"
 
-            # Deduplicate by MAC address. If we see it twice, the NAT mapped one wins.
             if mac not in found_cams or "NAT Active" in nat_status:
                 found_cams[mac] = {
                     "ip": ip,
@@ -378,14 +402,14 @@ def camera_snapshot(cam_id):
     safe_user = urllib.parse.quote(cam['username']) if cam['username'] else ""
     safe_pass = urllib.parse.quote(cam['password']) if cam['password'] else ""
     auth_url = cam['rtsp_url'].replace("rtsp://", f"rtsp://{safe_user}:{safe_pass}@") if safe_user and safe_pass else cam['rtsp_url']
-    
+
     snap_url = auth_url.replace("/101", "/102")
     out_file = f"/tmp/cam_snap_{cam_id}.jpg"
     cmd = ["/usr/bin/ffmpeg", "-y", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", snap_url, "-vf", "scale=320:-1", "-frames:v", "1", "-update", "1", "-q:v", "5", "-f", "image2", out_file]
-    
+
     try: subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except subprocess.TimeoutExpired: pass
-    
+
     if os.path.exists(out_file): return send_file(out_file, mimetype='image/jpeg')
     return send_file(io.BytesIO(b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b'), mimetype='image/gif')
 
@@ -414,15 +438,169 @@ def run_speedtest():
             conn.execute("INSERT INTO speedtests VALUES (?, ?, ?, ?)", (int(time.time()), download, upload, ping))
             conn.commit()
         finally: conn.close()
-        if download < 80.0: send_info("[WARNING] Slow Internet", f"Speed dropped below 80 Mbps.\nDownload: {download} Mbps\nUpload: {upload} Mbps", 15105570, severity="warning")
+        if download < 50.0: send_info("[WARNING] Slow Internet", f"Speed dropped below 80 Mbps.\nDownload: {download} Mbps\nUpload: {upload} Mbps", 15105570, severity="warning")
     except Exception as e: print(f"Speedtest failed: {e}")
 
 def monitor_speedtest():
     time.sleep(10)
     while True: run_speedtest(); time.sleep(900)
 
+_last_heartbeat_write = 0
+
+
+def _write_heartbeat():
+    global _last_heartbeat_write
+    now = int(time.time())
+    if now - _last_heartbeat_write < 60:
+        return
+    try:
+        with open("data/heartbeat", "w") as f:
+            f.write(str(now))
+        _last_heartbeat_write = now
+    except Exception:
+        pass
+
+
+def send_daily_report():
+    now = int(time.time())
+    day_ago = now - 86400
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        try:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*), AVG(cpu), AVG(ram), AVG(ping) FROM telemetry WHERE timestamp >= ?", (day_ago,))
+            tele_row = c.fetchone()
+            c.execute("SELECT COUNT(*), AVG(download), AVG(upload) FROM speedtests WHERE timestamp >= ?", (day_ago,))
+            speed_row = c.fetchone()
+            c.execute("SELECT COUNT(*) FROM incidents WHERE timestamp >= ?", (day_ago,))
+            incidents = c.fetchone()[0]
+        finally:
+            conn.close()
+        fields = [
+            {"name": "Telemetry samples", "value": str(tele_row[0]), "inline": True},
+            {"name": "Avg CPU", "value": f"{tele_row[1]:.1f}%" if tele_row[1] else "n/a", "inline": True},
+            {"name": "Avg Ping", "value": f"{tele_row[3]:.1f} ms" if tele_row[3] else "n/a", "inline": True},
+            {"name": "Speedtests", "value": str(speed_row[0]), "inline": True},
+            {"name": "Avg Download", "value": f"{speed_row[1]:.1f} Mbps" if speed_row[1] else "n/a", "inline": True},
+            {"name": "Avg Upload", "value": f"{speed_row[2]:.1f} Mbps" if speed_row[2] else "n/a", "inline": True},
+            {"name": "Incidents", "value": str(incidents), "inline": True},
+        ]
+        send_discord_raw("[INFO] Daily Report", "", 3447003, fields=fields)
+    except Exception as e:
+        print(f"Daily report failed: {e}")
+    _state["last_daily_sent"] = now
+    save_state()
+
+
+def _maybe_send_daily_report():
+    now = datetime.now()
+    last = _state.get("last_daily_sent", 0)
+    last_dt = datetime.fromtimestamp(last) if last else None
+    if now.hour >= 8 and (last_dt is None or last_dt.date() < now.date()):
+        send_daily_report()
+
+
+
+_camera_alert_state = {}
+_wan_ip_state = None
+
+def _check_cameras():
+    global _camera_alert_state
+    alerts_enabled = _state.get("camera_alerts", False)
+    if not alerts_enabled:
+        return
+    cams = get_cameras(app.secret_key)
+    for cam in cams:
+        cid = cam["id"]
+        safe_user = urllib.parse.quote(cam['username']) if cam['username'] else ""
+        safe_pass = urllib.parse.quote(cam['password']) if cam['password'] else ""
+        auth_url = cam['rtsp_url'].replace("rtsp://", f"rtsp://{safe_user}:{safe_pass}@") if safe_user and safe_pass else cam['rtsp_url']
+        snap_url = auth_url.replace("/101", "/102")
+        cmd = ["/usr/bin/ffmpeg", "-y", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", snap_url, "-frames:v", "1", "-f", "null", "-"]
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            online = res.returncode == 0
+        except Exception:
+            online = False
+        was_online = _camera_alert_state.get(cid, True)
+        if not online and was_online:
+            send_discord_raw(f"[ALERT] Camera Offline: {cam['name']}", f"Camera {cam['name']} is not responding.", 15105570, ping=True)
+            _camera_alert_state[cid] = False
+        elif online and not was_online:
+            send_discord_raw(f"[INFO] Camera Online: {cam['name']}", f"Camera {cam['name']} is back online.", 3066993)
+            _camera_alert_state[cid] = True
+
+def _check_honeypot():
+    global _state
+    logs = get_mikrotik_data("log")
+    if not logs:
+        return
+    for l in logs:
+        if "HONEYPOT-ALERT" in l.get("message", ""):
+            msg = l.get("message")
+            if _state.get("last_honeypot_log_id") == msg:
+                continue
+            _state["last_honeypot_log_id"] = msg
+            save_state()
+            send_discord_raw("[WARNING] Honeypot Triggered", f"Honeypot port 22 hit. Log: {msg}", 15105570, ping=True)
+
+def _check_hourly_report():
+    now = datetime.now()
+    if now.minute != 0:
+        return
+    last = _state.get("last_hourly_sent", 0)
+    if int(time.time()) - last < 3600:
+        return
+    _state["last_hourly_sent"] = int(time.time())
+    save_state()
+    now_ts = int(time.time())
+    hour_ago = now_ts - 3600
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM speedtests WHERE timestamp >= ? AND download < 50.0", (hour_ago,))
+        slow_count = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM incidents WHERE timestamp >= ?", (hour_ago,))
+        inc_count = c.fetchone()[0]
+        conn.close()
+        if slow_count > 0 or inc_count > 0:
+            send_discord_raw("[INFO] Hourly Report", f"Notable events in the last hour:\nSlow Speedtests: {slow_count}\nIncidents: {inc_count}", 3447003)
+    except Exception:
+        pass
+
+def _check_wan_ip():
+    global _wan_ip_state
+    ip = get_mikrotik_data("ip/cloud")
+    if ip and isinstance(ip, list) and len(ip) > 0:
+        current_ip = ip[0].get("public-address", "")
+        if current_ip and _wan_ip_state and current_ip != _wan_ip_state:
+            send_discord_raw("[INFO] WAN IP Changed", f"New WAN IP: {current_ip}", 3447003)
+        _wan_ip_state = current_ip
+
+@app.route("/api/update_interface", methods=["POST"])
+@login_required
+def update_interface():
+    data = request.json
+    name = data.get("name")
+    desc = data.get("description", "")
+    if not name:
+        return jsonify({"status": "error"})
+    ifaces = load_ifaces()
+    ifaces[name] = desc
+    save_ifaces(ifaces)
+    return jsonify({"status": "success"})
+
+@app.route("/api/toggle_camera_alerts", methods=["POST"])
+@login_required
+def toggle_camera_alerts():
+    action = request.json.get("action")
+    _state["camera_alerts"] = (action == "enable")
+    latest_telemetry["camera_alerts"] = _state["camera_alerts"]
+    save_state()
+    return jsonify({"status": "success"})
+
 def monitor_telemetry():
-    last_rx = 0; last_tx = 0; last_time = time.time(); last_write = 0
+    last_rx = 0; last_tx = 0; last_time = time.time(); last_write = 0; last_honeypot = 0; last_wan = 0; last_cam = 0
     while True:
         try:
             res = get_mikrotik_data("system/resource")
@@ -482,6 +660,23 @@ def monitor_telemetry():
                     finally: conn.close()
                 except Exception: pass
         except Exception: pass
+        now_i = int(time.time())
+        
+        if now_i - last_honeypot >= 60:
+            _check_honeypot()
+            last_honeypot = now_i
+            
+        if now_i - last_wan >= 600:
+            _check_wan_ip()
+            last_wan = now_i
+            
+        if now_i - last_cam >= 30:
+            _check_cameras()
+            last_cam = now_i
+            
+        _write_heartbeat()
+        _maybe_send_daily_report()
+        _check_hourly_report()
         time.sleep(2)
 
 # --- CORE ROUTES ---
@@ -586,10 +781,10 @@ def connections():
     bridge_hosts = get_mikrotik_data("interface/bridge/host")
     rules = get_mikrotik_data("ip/firewall/filter")
 
-    custom_names = load_custom_names() if 'load_custom_names' in globals() else {}
+    custom_names = {}
     if os.path.exists(DEVICES_FILE):
         with open(DEVICES_FILE, "r") as f: custom_names = json.load(f)
-        
+
     devices = {}
     blocked_ips = set()
     if rules:
@@ -817,7 +1012,7 @@ def test_alert():
         record_incident(title, msg, "success" if "Success" in title else "info")
     def cleanup():
         time.sleep(20)
-        for mid in discord_ids: 
+        for mid in discord_ids:
             webhook_url = getattr(config, "DISCORD_WEBHOOK_URL", "")
             if webhook_url: requests.delete(f"{webhook_url}/messages/{mid}", timeout=3)
     threading.Thread(target=cleanup).start()
@@ -898,12 +1093,20 @@ def acquire_lock():
     except BlockingIOError: print("Another dashboard instance is already running. Exiting."); sys.exit(1)
 
 if __name__ == "__main__":
+    os.makedirs("data", exist_ok=True)
     lock_handle = acquire_lock()
     load_state()
     init_db()
     init_camera_db()
     startup_catchup()
     sync_go2rtc()
+    try:
+        latest_telemetry["panic"] = rule_exists("PANIC-BLOCK")
+        latest_telemetry["camera_kill"] = rule_exists("CAMERA-KILL")
+        latest_telemetry["bedtime"] = rule_exists("Bedtime for Wi-Fi")
+        latest_telemetry["camera_alerts"] = _state.get("camera_alerts", False)
+    except Exception as e:
+        print(f"State sync at startup failed: {e}")
     threading.Thread(target=monitor_telemetry, daemon=True).start()
     threading.Thread(target=monitor_speedtest, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
