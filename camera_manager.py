@@ -1,12 +1,14 @@
+import os
 import sqlite3
 import base64
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-DB_FILE = "cameras.db"
+DB_FILE = "data/cameras.db"
 
 def init_camera_db():
+    os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS cameras 
@@ -26,6 +28,7 @@ def get_fernet(secret_key):
 def add_camera(name, rtsp_url, username, password, secret_key):
     f = get_fernet(secret_key)
     encrypted_pw = f.encrypt(password.encode()) if password else None
+    os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT INTO cameras (name, rtsp_url, username, password) VALUES (?, ?, ?, ?)", 
@@ -36,6 +39,7 @@ def add_camera(name, rtsp_url, username, password, secret_key):
 def update_camera(cam_id, name, rtsp_url, username, password, secret_key):
     f = get_fernet(secret_key)
     encrypted_pw = f.encrypt(password.encode()) if password else None
+    os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     if encrypted_pw:
@@ -49,6 +53,7 @@ def update_camera(cam_id, name, rtsp_url, username, password, secret_key):
 
 def get_cameras(secret_key):
     f = get_fernet(secret_key)
+    os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT id, name, rtsp_url, username, password FROM cameras")
@@ -62,6 +67,7 @@ def get_cameras(secret_key):
     return cams
 
 def delete_camera(cam_id):
+    os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM cameras WHERE id = ?", (cam_id,))

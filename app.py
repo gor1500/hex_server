@@ -58,13 +58,13 @@ def load_user(user_id):
 
 BASE_URL = f"https://{config.ROUTER_IP}/rest"
 AUTH = (config.ROUTER_USER, config.ROUTER_PASS)
-DEVICES_FILE = "devices.json"
-DB_FILE = "speedtest.db"
-BANS_FILE = "bans.json"
-IFACES_FILE = "interfaces.json"
-STATE_FILE = "state.json"
-LOCK_FILE = "dashboard.lock"
-PENDING_FILE = "pending_discord.json"
+DEVICES_FILE = "data/devices.json"
+DB_FILE = "data/speedtest.db"
+BANS_FILE = "data/bans.json"
+IFACES_FILE = "data/interfaces.json"
+STATE_FILE = "data/state.json"
+LOCK_FILE = "data/dashboard.lock"
+PENDING_FILE = "data/pending_discord.json"
 TELEMETRY_WRITE_INTERVAL = 10
 
 latest_telemetry = {
@@ -275,7 +275,7 @@ def sync_go2rtc():
             requests.put(f"http://127.0.0.1:1984/api/streams?name=cam_{c['id']}", data={"src": auth_url}, timeout=2)
         except Exception: pass
         
-    with open("/opt/hex-dashboard/go2rtc.yaml", "w") as f:
+    with open("data/go2rtc.yaml", "w") as f:
         f.write(yaml_content)
 
 

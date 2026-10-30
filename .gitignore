@@ -2,21 +2,15 @@
 config.py
 secret.key
 
-# Databases and state
-*.db
-*.db-shm
-*.db-wal
-*.json
-*.lock
-go2rtc.yaml
+# Data and state
+data/
 
 # Python virtual environment
 venv/
 __pycache__/
 *.pyc
 
-# Local absolute path scripts
-sandbox-deepcode.sh
-
-# Temp files
-/tmp/
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
