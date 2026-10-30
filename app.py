@@ -14,6 +14,9 @@ import subprocess
 import threading
 import atexit
 import urllib.parse
+import paramiko
+import queue
+import base64
 
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request, redirect, url_for, flash, send_file, Response
@@ -186,8 +189,6 @@ def unban_ip(ip):
     bans["active"].pop(ip, None)
     save_bans(bans)
 
-# --- ALERT ROUTING ---
-
 def send_discord_raw(title, message="", color=3447003, ping=False, fields=None):
     webhook_url = getattr(config, "DISCORD_WEBHOOK_URL", "")
     if not webhook_url or webhook_url == "YOUR_DISCORD_WEBHOOK_URL_HERE": return None
@@ -233,8 +234,6 @@ def send_emergency(title, message, color=15158332, severity="emergency"):
 def send_info(title, message, color=3447003, severity="info"):
     record_incident(title, message, severity)
     return send_discord_raw(title, message, color, ping=False) is not None
-
-# --- SHUTDOWN & STARTUP HANDLERS ---
 
 def handle_shutdown(signum, frame):
     _state["last_shutdown"] = int(time.time())
@@ -285,7 +284,13 @@ def startup_catchup():
 signal.signal(signal.SIGTERM, handle_shutdown)
 atexit.register(lambda: handle_shutdown(None, None) if os.environ.get("WERKZEUG_RUN_MAIN") == "true" else None)
 
-# --- CAMERA ROUTES & GO2RTC SYNC ---
+def get_bedtime_state():
+    rules = get_mikrotik_data("ip/firewall/filter")
+    if not rules: return False
+    for r in rules:
+        if r.get("comment") == "Bedtime for Wi-Fi":
+            return r.get("disabled", "false") == "false"
+    return False
 
 def sync_go2rtc():
     cams = get_cameras(app.secret_key)
@@ -294,23 +299,18 @@ def sync_go2rtc():
         safe_user = urllib.parse.quote(c['username']) if c['username'] else ""
         safe_pass = urllib.parse.quote(c['password']) if c['password'] else ""
         auth_url = c['rtsp_url'].replace("rtsp://", f"rtsp://{safe_user}:{safe_pass}@") if safe_user and safe_pass else c['rtsp_url']
-
         if "/101" in auth_url: auth_url = auth_url.replace("/101", "/102")
         yaml_content += f"  cam_{c['id']}:\n    - {auth_url}\n"
-
         try:
             requests.put(f"http://127.0.0.1:1984/api/streams?name=cam_{c['id']}", data={"src": auth_url}, timeout=2)
         except Exception: pass
-
     with open("data/go2rtc.yaml", "w") as f:
         f.write(yaml_content)
-
 
 @app.route("/api/scan_cameras")
 @login_required
 def scan_cameras():
     nat_rules = get_mikrotik_data("ip/firewall/nat")
-
     nat_map = {}
     if nat_rules:
         for rule in nat_rules:
@@ -319,32 +319,25 @@ def scan_cameras():
                 to_addr = rule.get("to-addresses")
                 if dst and to_addr:
                     nat_map[to_addr.split("/")[0]] = dst.split("/")[0]
-
     for physical_ip in nat_map.keys():
         try: subprocess.run(["ping", "-c", "1", "-W", "1", physical_ip], capture_output=True, timeout=2)
         except: pass
-
     arp_table = get_mikrotik_data("ip/arp")
     if not arp_table: return jsonify([])
-
     cam_vendors = {
         "4C:F5:DC": "Hikvision / HiLook", "C0:56:E3": "Hikvision", "44:19:B6": "Hikvision",
         "BC:AD:28": "Hikvision", "28:57:BE": "Hikvision",
         "58:10:8C": "Intelbras", "54:BA:D9": "Intelbras",
         "3C:EF:8C": "Dahua / Intelbras", "4C:11:BF": "Dahua", "90:02:A9": "Dahua"
     }
-
     found_cams = {}
-
     for entry in arp_table:
         ip = entry.get("address")
         mac = entry.get("mac-address", "").upper()
         if not ip or not mac: continue
-
         prefix = mac[:8]
         if prefix in cam_vendors:
             vendor = cam_vendors[prefix]
-
             if ip in nat_map:
                 final_ip = nat_map[ip]
                 nat_status = f"NAT Active (Mapped to {final_ip})"
@@ -354,20 +347,13 @@ def scan_cameras():
             else:
                 final_ip = ip
                 nat_status = "Direct (No NAT)"
-
             rtsp_path = "/Streaming/Channels/101" if "Hikvision" in vendor or "HiLook" in vendor else "/cam/realmonitor?channel=1&subtype=0"
             rtsp_url = f"rtsp://{final_ip}:554{rtsp_path}"
-
             if mac not in found_cams or "NAT Active" in nat_status:
                 found_cams[mac] = {
-                    "ip": ip,
-                    "final_ip": final_ip,
-                    "mac": mac,
-                    "vendor": vendor,
-                    "rtsp_url": rtsp_url,
-                    "nat_status": nat_status
+                    "ip": ip, "final_ip": final_ip, "mac": mac,
+                    "vendor": vendor, "rtsp_url": rtsp_url, "nat_status": nat_status
                 }
-
     return jsonify(list(found_cams.values()))
 
 @app.route("/api/cameras", methods=["GET", "POST", "DELETE", "PUT"])
@@ -398,18 +384,14 @@ def camera_snapshot(cam_id):
     cams = get_cameras(app.secret_key)
     cam = next((c for c in cams if c["id"] == cam_id), None)
     if not cam: return "Camera not found", 404
-
     safe_user = urllib.parse.quote(cam['username']) if cam['username'] else ""
     safe_pass = urllib.parse.quote(cam['password']) if cam['password'] else ""
     auth_url = cam['rtsp_url'].replace("rtsp://", f"rtsp://{safe_user}:{safe_pass}@") if safe_user and safe_pass else cam['rtsp_url']
-
     snap_url = auth_url.replace("/101", "/102")
     out_file = f"/tmp/cam_snap_{cam_id}.jpg"
     cmd = ["/usr/bin/ffmpeg", "-y", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", snap_url, "-vf", "scale=320:-1", "-frames:v", "1", "-update", "1", "-q:v", "5", "-f", "image2", out_file]
-
     try: subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except subprocess.TimeoutExpired: pass
-
     if os.path.exists(out_file): return send_file(out_file, mimetype='image/jpeg')
     return send_file(io.BytesIO(b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b'), mimetype='image/gif')
 
@@ -426,8 +408,6 @@ def camera_test(cam_id):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
     return f"<h1>Camera Test</h1><p><b>URL Used:</b> {auth_url}</p><p><b>Return Code:</b> {result.returncode}</p><h3>FFMPEG Output:</h3><pre>{result.stderr.decode()}</pre>"
 
-# --- BACKGROUND THREADS ---
-
 def run_speedtest():
     try:
         st = speedtest.Speedtest(); st.get_servers(); st.get_best_server()
@@ -438,7 +418,7 @@ def run_speedtest():
             conn.execute("INSERT INTO speedtests VALUES (?, ?, ?, ?)", (int(time.time()), download, upload, ping))
             conn.commit()
         finally: conn.close()
-        if download < 50.0: send_info("[WARNING] Slow Internet", f"Speed dropped below 80 Mbps.\nDownload: {download} Mbps\nUpload: {upload} Mbps", 15105570, severity="warning")
+        if download < 50.0: send_info("[WARNING] Slow Internet", f"Speed dropped below 50 Mbps.\nDownload: {download} Mbps\nUpload: {upload} Mbps", 15105570, severity="warning")
     except Exception as e: print(f"Speedtest failed: {e}")
 
 def monitor_speedtest():
@@ -446,7 +426,6 @@ def monitor_speedtest():
     while True: run_speedtest(); time.sleep(900)
 
 _last_heartbeat_write = 0
-
 
 def _write_heartbeat():
     global _last_heartbeat_write
@@ -459,7 +438,6 @@ def _write_heartbeat():
         _last_heartbeat_write = now
     except Exception:
         pass
-
 
 def send_daily_report():
     now = int(time.time())
@@ -491,15 +469,12 @@ def send_daily_report():
     _state["last_daily_sent"] = now
     save_state()
 
-
 def _maybe_send_daily_report():
     now = datetime.now()
     last = _state.get("last_daily_sent", 0)
     last_dt = datetime.fromtimestamp(last) if last else None
     if now.hour >= 8 and (last_dt is None or last_dt.date() < now.date()):
         send_daily_report()
-
-
 
 _camera_alert_state = {}
 _wan_ip_state = None
@@ -634,7 +609,6 @@ def monitor_telemetry():
                 descs = load_ifaces()
                 for iface in ifaces_list: iface["description"] = descs.get(iface["name"], "Unknown")
                 latest_telemetry["interfaces"] = ifaces_list
-
             ping_res = subprocess.run(["ping", "-c", "1", "-W", "1", "1.1.1.1"], capture_output=True, text=True, timeout=2)
             ping_ms = 0
             if ping_res.returncode == 0:
@@ -644,7 +618,6 @@ def monitor_telemetry():
                         except Exception: pass
                         break
             latest_telemetry["ping"] = ping_ms
-
             now_i = int(time.time())
             if now_i - last_write >= TELEMETRY_WRITE_INTERVAL:
                 last_write = now_i
@@ -660,6 +633,7 @@ def monitor_telemetry():
                     finally: conn.close()
                 except Exception: pass
         except Exception: pass
+        
         now_i = int(time.time())
         
         if now_i - last_honeypot >= 60:
@@ -678,8 +652,6 @@ def monitor_telemetry():
         _maybe_send_daily_report()
         _check_hourly_report()
         time.sleep(2)
-
-# --- CORE ROUTES ---
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -780,18 +752,15 @@ def connections():
     arp = get_mikrotik_data("ip/arp")
     bridge_hosts = get_mikrotik_data("interface/bridge/host")
     rules = get_mikrotik_data("ip/firewall/filter")
-
     custom_names = {}
     if os.path.exists(DEVICES_FILE):
         with open(DEVICES_FILE, "r") as f: custom_names = json.load(f)
-
     devices = {}
     blocked_ips = set()
     if rules:
         for r in rules:
             c = r.get("comment") or ""
             if c.startswith("BLOCK-"): blocked_ips.add(c.replace("BLOCK-", ""))
-
     if leases:
         for l in leases:
             ip = l.get("address"); mac = l.get("mac-address", "-").upper()
@@ -799,7 +768,6 @@ def connections():
             if mac not in devices:
                 devices[mac] = {"mac": mac, "ip": ip, "hostname": l.get("host-name", "Unknown"), "connections": [], "total": 0, "all_ips": set()}
             devices[mac]["all_ips"].add(ip)
-
     if arp:
         for a in arp:
             ip = a.get("address"); mac = a.get("mac-address", "-").upper()
@@ -808,11 +776,9 @@ def connections():
                 devices[mac] = {"mac": mac, "ip": ip, "hostname": "Unknown", "connections": [], "total": 0, "all_ips": set()}
             devices[mac]["all_ips"].add(ip)
             if devices[mac]["hostname"] == "Unknown" and a.get("comment"): devices[mac]["hostname"] = a.get("comment")
-
     ip_to_mac = {}
     for mac, dev in devices.items():
         for ip in dev["all_ips"]: ip_to_mac[ip] = mac
-
     if conns:
         for c in conns:
             src_ip = c.get("src-address", "").split(":")[0]; dst_ip = c.get("dst-address", "").split(":")[0]
@@ -824,13 +790,11 @@ def connections():
                 if existing: existing["count"] += 1
                 else: devices[mac]["connections"].append({"dst": dst_ip, "port": dst_port, "proto": proto, "count": 1})
                 devices[mac]["total"] += 1; devices[mac]["ip"] = src_ip
-
     mac_port = {}
     if bridge_hosts:
         for h in bridge_hosts:
             mac = h.get("mac-address", "").upper()
             if h.get("local") == "false" and h.get("interface") != "bridge": mac_port[mac] = h.get("interface")
-
     final_list = []
     for mac, dev in devices.items():
         port = mac_port.get(mac, "WiFi/Idle"); ip = dev["ip"]
@@ -840,13 +804,11 @@ def connections():
         dev["connections"].sort(key=lambda x: x["count"], reverse=True)
         is_blocked = any(ip in blocked_ips for ip in dev["all_ips"])
         final_list.append({"device": display_name, "ip": ip, "mac": mac, "port": port, "trusted": is_trusted, "connections": dev["connections"], "total": dev["total"], "blocked": is_blocked})
-
     grouped_by_name = {}; unknown_devices = []
     for dev in final_list:
         if dev["device"] not in ["Unknown", "Randomized MAC (Phone/Tablet)"] and "Unknown Vendor" not in dev["device"]:
             grouped_by_name.setdefault(dev["device"], []).append(dev)
         else: unknown_devices.append(dev)
-
     merged_devices = []
     for name, group in grouped_by_name.items():
         active_devices = [d for d in group if d["total"] > 0]
@@ -859,7 +821,6 @@ def connections():
             merged_devices.append(primary)
         else: merged_devices.extend(group)
     merged_devices.extend(unknown_devices)
-
     for dev in merged_devices:
         grouped_conns = {}
         for conn in dev["connections"]:
@@ -867,7 +828,6 @@ def connections():
             if ck in grouped_conns: grouped_conns[ck]["count"] += conn["count"]
             else: grouped_conns[ck] = conn
         dev["connections"] = sorted(grouped_conns.values(), key=lambda x: x["count"], reverse=True)
-
     sorted_devices = sorted(merged_devices, key=lambda x: (-x["total"], not x["trusted"]))
     return jsonify(sorted_devices)
 
@@ -1034,6 +994,7 @@ def toggle_bedtime():
         for rule in rules:
             if rule.get("comment") == "Bedtime for Wi-Fi":
                 requests.patch(f"{BASE_URL}/ip/firewall/filter/{rule.get('.id')}", auth=AUTH, json={"disabled": "true" if action == "disable" else "false"}, verify=False)
+                latest_telemetry["bedtime"] = (action == "enable")
                 return jsonify({"status": "success"})
     return jsonify({"status": "error"})
 
@@ -1071,20 +1032,133 @@ def restart_server():
     threading.Thread(target=restart).start()
     return jsonify({"status": "success"})
 
-@app.route("/api/terminal", methods=["POST"])
-@login_required
-def terminal():
-    cmd = request.json.get("command")
-    if not cmd: return jsonify({"output": "No command provided."})
-    if len(cmd) > 500: return jsonify({"output": "Command too long."})
+ssh_client = None
+ssh_channel = None
+ssh_queue = queue.Queue()
+
+def init_ssh_shell():
+    global ssh_client, ssh_channel
     try:
-        ssh_cmd = f'ssh admin@{config.ROUTER_IP} "{cmd}"'
-        result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True, timeout=8)
-        out = result.stdout + result.stderr
-        if not out.strip(): out = "Command executed (no output)."
-        return jsonify({"output": out})
-    except subprocess.TimeoutExpired: return jsonify({"output": "Command timed out."})
-    except Exception as e: return jsonify({"output": f"Error: {str(e)}"})
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(config.ROUTER_IP, username=config.ROUTER_USER, password=config.ROUTER_PASS, timeout=5)
+        ssh_channel = ssh_client.invoke_shell(width=150, height=50)
+        ssh_channel.settimeout(0.1)
+        
+        def reader():
+            while True:
+                try:
+                    if ssh_channel.recv_ready():
+                        data = ssh_channel.recv(4096)
+                        b64_data = base64.b64encode(data).decode('ascii')
+                        ssh_queue.put(b64_data)
+                    else:
+                        time.sleep(0.05)
+                except Exception:
+                    break
+        threading.Thread(target=reader, daemon=True).start()
+    except Exception as e:
+        print(f"SSH Terminal init failed: {e}")
+
+@app.route("/api/terminal/stream")
+@login_required
+def terminal_stream():
+    def generate():
+        while True:
+            try:
+                data = ssh_queue.get(timeout=1)
+                yield "data: " + data + "\n\n"
+            except queue.Empty:
+                yield ": ping\n\n"
+            except GeneratorExit:
+                break
+    return Response(generate(), mimetype="text/event-stream")
+
+@app.route("/api/terminal/input", methods=["POST"])
+@login_required
+def terminal_input():
+    global ssh_client, ssh_channel
+    if not ssh_client or not ssh_client.get_transport() or not ssh_client.get_transport().is_active():
+        init_ssh_shell()
+    
+    data = request.json.get("data", "")
+    try:
+        if ssh_channel:
+            ssh_channel.send(data)
+    except Exception:
+        pass
+    return jsonify({"status": "success"})
+
+@app.route("/api/terminal/resize", methods=["POST"])
+@login_required
+def terminal_resize():
+    cols = request.json.get("cols", 80)
+    rows = request.json.get("rows", 24)
+    try:
+        if ssh_channel:
+            ssh_channel.resize_pty(width=cols, height=rows)
+    except Exception:
+        pass
+    return jsonify({"status": "success"})
+
+
+@app.route("/api/sync/check")
+@login_required
+def sync_check():
+    diffs = []
+    rules = get_mikrotik_data("ip/firewall/filter")
+    if rules is None: return jsonify({"error": "Router unreachable"})
+    
+    router_panic = any(r.get("comment") == "PANIC-BLOCK" for r in rules)
+    router_camera = any(r.get("comment") == "CAMERA-KILL" for r in rules)
+    router_bedtime = False
+    for r in rules:
+        if r.get("comment") == "Bedtime for Wi-Fi":
+            router_bedtime = r.get("disabled", "false") == "false"
+            break
+            
+    if _state.get("panic", False) != router_panic:
+        diffs.append({"key": "panic", "db": _state.get("panic"), "rb": router_panic})
+    if _state.get("camera_kill", False) != router_camera:
+        diffs.append({"key": "camera_kill", "db": _state.get("camera_kill"), "rb": router_camera})
+    if _state.get("bedtime", False) != router_bedtime:
+        diffs.append({"key": "bedtime", "db": _state.get("bedtime"), "rb": router_bedtime})
+        
+    return jsonify(diffs)
+
+@app.route("/api/sync/push", methods=["POST"])
+@login_required
+def sync_push():
+    if _state.get("panic"): add_rule("forward", None, "pppoe-wan", "PANIC-BLOCK", idempotent=True)
+    else: remove_rule("PANIC-BLOCK")
+    
+    if _state.get("camera_kill"): add_rule("forward", "ether4", "pppoe-wan", "CAMERA-KILL", idempotent=True)
+    else: remove_rule("CAMERA-KILL")
+    
+    rules = get_mikrotik_data("ip/firewall/filter")
+    if rules:
+        for r in rules:
+            if r.get("comment") == "Bedtime for Wi-Fi":
+                requests.patch(f"{BASE_URL}/ip/firewall/filter/{r.get('.id')}", auth=AUTH, json={"disabled": "false" if _state.get("bedtime") else "true"}, verify=False)
+    return jsonify({"status": "success"})
+
+@app.route("/api/sync/pull", methods=["POST"])
+@login_required
+def sync_pull():
+    rules = get_mikrotik_data("ip/firewall/filter")
+    if rules:
+        _state["panic"] = any(r.get("comment") == "PANIC-BLOCK" for r in rules)
+        _state["camera_kill"] = any(r.get("comment") == "CAMERA-KILL" for r in rules)
+        for r in rules:
+            if r.get("comment") == "Bedtime for Wi-Fi":
+                _state["bedtime"] = r.get("disabled", "false") == "false"
+                break
+    save_state()
+    
+    latest_telemetry["panic"] = _state["panic"]
+    latest_telemetry["camera_kill"] = _state["camera_kill"]
+    latest_telemetry["bedtime"] = _state["bedtime"]
+    return jsonify({"status": "success"})
 
 def acquire_lock():
     f = open(LOCK_FILE, "w")
@@ -1103,10 +1177,11 @@ if __name__ == "__main__":
     try:
         latest_telemetry["panic"] = rule_exists("PANIC-BLOCK")
         latest_telemetry["camera_kill"] = rule_exists("CAMERA-KILL")
-        latest_telemetry["bedtime"] = rule_exists("Bedtime for Wi-Fi")
+        latest_telemetry["bedtime"] = get_bedtime_state()
         latest_telemetry["camera_alerts"] = _state.get("camera_alerts", False)
     except Exception as e:
         print(f"State sync at startup failed: {e}")
+    threading.Thread(target=init_ssh_shell, daemon=True).start()
     threading.Thread(target=monitor_telemetry, daemon=True).start()
     threading.Thread(target=monitor_speedtest, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

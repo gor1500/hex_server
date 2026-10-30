@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>hEX Command Center</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
     <style>
         :root { --bg-color: #0f172a; --card-bg: #1e293b; --text-main: #f8fafc; --text-muted: #94a3b8; --accent: #38bdf8; --success: #4ade80; --danger: #f87171; --warning: #fbbf24;}
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: var(--bg-color); color: var(--text-main); margin: 0; padding: 20px; }
@@ -74,10 +77,10 @@
         .l-err { color: #f87171 !important; }
         .l-warn { color: #fbbf24 !important; }
         .l-info { color: #4ade80 !important; }
-        
-        .terminal-input-row { display: flex; gap: 10px; margin-bottom: 10px; }
-        .terminal-input { flex: 1; background-color: #000; border: 1px solid #334155; color: #00ff00; font-family: 'Courier New', monospace; padding: 10px; border-radius: 5px; font-size: 14px; outline: none; }
-        .terminal-output { background-color: #000; color: #ccc; font-family: 'Courier New', monospace; font-size: 13px; height: 150px; overflow-y: auto; padding: 10px; border-radius: 5px; border: 1px solid #334155; white-space: pre-wrap; }
+
+        .term-container { width: 100%; height: 250px; background: #000; border-radius: 5px; border: 1px solid #334155; padding: 5px; overflow: hidden; }
+        .term-fullscreen .term-container { height: calc(100vh - 120px); }
+        .term-fullscreen .modal-content { max-width: 95vw; width: 95vw; height: 95vh; }
 
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(15, 23, 42, 0.95); overflow-y: auto; }
         .modal-content { margin: 20px auto; width: 95%; max-width: 1200px; }
@@ -107,8 +110,6 @@
             .log-search { width: 100%; margin-bottom: 5px; }
             .action-bar { justify-content: space-between; }
             .action-btn { flex-grow: 1; }
-            .terminal-input-row { flex-direction: column; }
-            .terminal-input { width: 100%; }
             .grafana-controls { flex-direction: column; align-items: flex-start; width: 100%; }
             .grafana-controls select { width: 100%; }
         }
@@ -163,7 +164,6 @@
                     <span class="stat-label">Camera Alerts (Discord)</span>
                     <label class="switch"><input type="checkbox" id="camera-alerts-toggle"><span class="slider"></span></label>
                 </div>
-
             </div>
         </div>
 
@@ -187,12 +187,11 @@
             </div>
             
             <div class="card">
-                <h3>Web Terminal (RouterOS)</h3>
-                <div class="terminal-input-row">
-                    <input type="text" id="term-input" class="terminal-input" placeholder="Type command" onkeypress="handleTermEnter(event)">
-                    <button class="btn btn-accent" onclick="runCommand()">Run</button>
+                <div class="log-header">
+                    <h3>Web Terminal (RouterOS)</h3>
+                    <button class="btn btn-accent" onclick="openTerminalModal()" style="padding: 4px 8px; font-size: 11px;">Fullscreen</button>
                 </div>
-                <pre class="terminal-output" id="term-output">Ready. Type a command above...</pre>
+                <div id="term-inline" class="term-container"></div>
             </div>
         </div>
 
@@ -321,7 +320,6 @@
         </div>
     </div>
 
-    
     <div id="scan-modal" class="modal">
         <div class="modal-content" style="max-width: 800px; background-color: var(--card-bg); padding: 30px; border-radius: 10px;">
             <div class="modal-header">
@@ -348,6 +346,28 @@
         </div>
     </div>
 
+    <div id="terminal-modal" class="modal term-fullscreen">
+        <div class="modal-content" style="background-color: var(--card-bg); padding: 20px; border-radius: 10px; margin-top: 2vh; display: flex; flex-direction: column;">
+            <div class="modal-header" style="margin-bottom: 10px;">
+                <h2>RouterOS Terminal</h2>
+                <button class="btn btn-panic" onclick="closeTerminalModal()">Close</button>
+            </div>
+            <div id="term-fullscreen-container" style="flex: 1; background: #000; border-radius: 5px;"></div>
+        </div>
+    </div>
+
+    <div id="sync-modal" class="modal">
+        <div class="modal-content" style="max-width: 600px; background-color: var(--card-bg); padding: 30px; border-radius: 10px; margin-top: 10vh;">
+            <h2 style="color: var(--warning); margin-bottom: 20px;">Configuration Mismatch</h2>
+            <p style="color: var(--text-muted); margin-bottom: 20px;">The router state does not match the dashboard database. Choose which one to keep:</p>
+            <ul id="sync-diff-list" style="color: white; margin-bottom: 30px; font-family: monospace; background: #0f172a; padding: 15px; border-radius: 5px;"></ul>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn btn-accent" onclick="resolveSync('push')" style="flex: 1; padding: 10px;">Keep Dashboard (Push to Router)</button>
+                <button class="btn btn-warning" onclick="resolveSync('pull')" style="flex: 1; padding: 10px;">Keep Router (Pull to Dashboard)</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let logsPaused = false, currentLogs = [], isPanic = false;
         let openAccordions = new Set(); 
@@ -355,6 +375,48 @@
         let refreshIntervalId = null;
         let localCams = [];
         let editingCamId = null;
+
+        let termInline, termFull, fitAddonInline, fitAddonFull, termStream;
+        function initTerminal() {
+            termInline = new Terminal({ theme: { background: '#000000', foreground: '#00ff00' }, cursorBlink: true, fontSize: 13, fontFamily: 'monospace' });
+            fitAddonInline = new FitAddon.FitAddon();
+            termInline.loadAddon(fitAddonInline);
+            termInline.open(document.getElementById('term-inline'));
+            setTimeout(() => fitAddonInline.fit(), 100);
+
+            termFull = new Terminal({ theme: { background: '#000000', foreground: '#00ff00' }, cursorBlink: true, fontSize: 15, fontFamily: 'monospace' });
+            fitAddonFull = new FitAddon.FitAddon();
+            termFull.loadAddon(fitAddonFull);
+            termFull.open(document.getElementById('term-fullscreen-container'));
+
+            const handleData = (data) => {
+                fetch('/api/terminal/input', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({data}) });
+            };
+            termInline.onData(handleData);
+            termFull.onData(handleData);
+
+            const resizeHandler = () => {
+                fetch('/api/terminal/resize', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ cols: termFull.cols, rows: termFull.rows }) });
+            };
+            termFull.onResize((size) => { resizeHandler(); });
+
+            termStream = new EventSource('/api/terminal/stream');
+            termStream.onmessage = (e) => {
+                if (e.data === "") return;
+                const text = atob(e.data);
+                termInline.write(text);
+                termFull.write(text);
+            };
+        }
+
+        function openTerminalModal() {
+            document.getElementById('terminal-modal').style.display = 'block';
+            setTimeout(() => { fitAddonFull.fit(); termFull.focus(); }, 50);
+        }
+        function closeTerminalModal() {
+            document.getElementById('terminal-modal').style.display = 'none';
+            fitAddonInline.fit();
+        }
 
         const baseOptions = {
             responsive: true, maintainAspectRatio: false, animation: false,
@@ -483,15 +545,12 @@
             logWindow.scrollTop = logWindow.scrollHeight;
         }
 
-        async function runCommand() { const input = document.getElementById('term-input'); const cmd = input.value.trim(); if (!cmd) return; const out = document.getElementById('term-output'); out.textContent = `[Running] ${cmd} ...\n`; try { const res = await (await fetch('/api/terminal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ command: cmd }) })).json(); out.textContent += res.output; } catch (e) { out.textContent += "Error connecting to server."; } input.value = ''; out.scrollTop = out.scrollHeight; }
-        function handleTermEnter(e) { if (e.key === 'Enter') runCommand(); }
         async function rebootRouter() { if (!confirm("WARNING: Reboot the router?")) return; await fetch('/api/reboot', { method: 'POST' }); alert("Router rebooting."); }
         async function restartServer() { if (!confirm("Restart the Python Dashboard server?")) return; document.body.innerHTML = "<h1 style='color:white; text-align:center; margin-top:20%'>Restarting Server...</h1>"; await fetch('/api/restart-server', { method: 'POST' }); setTimeout(() => { window.location.reload(); }, 3000); }
         async function testAlert() { await fetch('/api/test_alert', { method: 'POST' }); alert("Test alert sent!"); }
         async function sendReport() { const btn = event.target; btn.disabled = true; btn.textContent = "Sending..."; await fetch('/api/report', { method: 'POST' }); setTimeout(() => { btn.textContent = "Send Report"; btn.disabled = false; }, 2000); }
         async function togglePanic() { const action = isPanic ? 'disable' : 'enable'; if (action === 'enable' && !confirm("KILL INTERNET FOR EVERYONE?")) return; await fetch('/api/panic', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) }); fetchStats(); }
         async function triggerBackup() { const btn = event.target; btn.textContent = "Saving..."; await fetch('/api/backup', { method: 'POST' }); setTimeout(() => { btn.textContent = "Backup Saved!"; setTimeout(() => btn.textContent = "Save Backup", 2000); }, 1000); }
-        async function sendWoL() { const btn = event.target; btn.textContent = "Sent!"; await fetch('/api/wol', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mac: "70:85:C2:2E:0A:6E" }) }); setTimeout(() => btn.textContent = "Wake PC", 2000); }
         function copyLogs() { let text = ""; currentLogs.forEach(l => { text += `[${l.time}] ${l.topics} ${l.message}\n`; }); navigator.clipboard.writeText(text).then(() => { const btn = document.getElementById('copy-btn'); btn.textContent = "Copied!"; setTimeout(() => btn.textContent = "Copy", 2000); }); }
         function togglePause() { logsPaused = !logsPaused; const btn = document.getElementById('pause-btn'); btn.textContent = logsPaused ? "Resume" : "Pause"; btn.style.color = logsPaused ? "var(--accent)" : "#fff"; }
         
@@ -501,19 +560,16 @@
         document.getElementById('camera-toggle').addEventListener('change', async (e) => { await fetch('/api/camera', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: e.target.checked ? 'disable' : 'enable' }) }); });
         document.getElementById('bedtime-toggle').addEventListener('change', async (e) => { await fetch('/api/bedtime', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: e.target.checked ? 'enable' : 'disable' }) }); });
 
-        
         async function scanCameras() {
             document.getElementById('scan-modal').style.display = 'block';
             const resDiv = document.getElementById('scan-results');
             resDiv.innerHTML = '<p>Scanning ARP table and NAT rules... Please wait.</p>';
-            
             try {
                 const cams = await (await fetch('/api/scan_cameras')).json();
                 if (cams.length === 0) {
                     resDiv.innerHTML = '<p style="color:var(--warning);">No known camera vendors found on the network. (Checked Hikvision, Intelbras, Dahua).</p>';
                     return;
                 }
-
                 let htmlStr = '<table style="width:100%; font-size:13px;"><thead><tr><th>Vendor</th><th>MAC</th><th>Physical IP</th><th>NAT Mapping</th><th>RTSP URL</th><th>Action</th></tr></thead><tbody>';
                 cams.forEach(c => {
                     htmlStr += `<tr>
@@ -527,7 +583,6 @@
                 });
                 htmlStr += '</tbody></table>';
                 resDiv.innerHTML = htmlStr;
-
             } catch (e) {
                 resDiv.innerHTML = '<p style="color:var(--danger);">Failed to run scan.</p>';
             }
@@ -607,6 +662,26 @@
         
         async function deleteCam(id) { if (!confirm("Delete this camera?")) return; await fetch('/api/cameras', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) }); loadCameras(); }
 
+        async function checkSync() {
+            try {
+                const res = await (await fetch('/api/sync/check')).json();
+                if (res.error) return;
+                if (res.length > 0) {
+                    const list = res.map(d => `<li>${d.key.toUpperCase()}: Dashboard = ${d.db}, Router = ${d.rb}</li>`).join('');
+                    document.getElementById('sync-diff-list').innerHTML = list;
+                    document.getElementById('sync-modal').style.display = 'block';
+                }
+            } catch(e) {}
+        }
+        
+        async function resolveSync(action) {
+            await fetch('/api/sync/' + action, { method: 'POST' });
+            document.getElementById('sync-modal').style.display = 'none';
+            fetchStats();
+        }
+
+        initTerminal();
+        checkSync();
         fetchStats(); fetchConns(); fetchBans(); fetchLogs();
         changeRefreshRate(); 
         setInterval(fetchLogs, 3000);
